@@ -28,7 +28,8 @@ import requests
 
 ARTIST_SELECT_PROMPT = """\
 Тебе дан пронумерованный список артистов из локальной музыкальной библиотеки.
-Формат: INDEX|АРТИСТ
+Формат строки: INDEX|АРТИСТ|КОЛ-ВО ТРЕКОВ|ГОДЫ|ПРИМЕРЫ ТРЕКОВ
+(некоторые поля могут отсутствовать)
 
 Задача: выбери артистов, у которых НАИБОЛЕЕ ВЕРОЯТНО есть треки, подходящие под запрос пользователя.
 Учитывай жанр, стиль, язык, настроение и эпоху. Выбирай щедро — лучше взять лишних, чем пропустить нужных.
@@ -65,6 +66,7 @@ DEFAULT_GOOGLE_MODEL = "gemini-2.0-flash"
 ARTIST_SELECT_TARGET = 80
 TRACK_CONTEXT_LIMIT = 1500
 TFIDF_CANDIDATES = 300
+MAX_TRACKS_PER_ARTIST = 30  # prevents any single artist from dominating the prompt
 
 
 # ---------------------------------------------------------------------------
@@ -407,29 +409,185 @@ def generate_m3u8(tracks, output_dir, user_query):
 # Two-step pipeline helpers
 # ---------------------------------------------------------------------------
 
-def _build_artist_list_text(artist_map):
-    """Format numbered artist list. Returns (text, {number: artist_key})."""
+_VARIANT_SUFFIX_RE = re.compile(
+    r"\s*[\(\[](live|concert|remaster(?:ed)?|acoustic|bonus|demo|"
+    r"концерт|вживую|акустика|ремастер|instrumental|radio[\s\-]edit|"
+    r"single[\s\-]version|deluxe|extended)[\)\]]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _load_rich_artist_data(data_dir):
+    """Load artists_for_ai.txt → {artist_name_lower: {count, years, samples}}.
+
+    Format: ID|NAME|TRACK_COUNT|YEARS|SAMPLE_TITLES
+    Built by catalog_builder.write_catalogs().
+    """
+    artists_file = os.path.join(data_dir, "artists_for_ai.txt")
+    rich = {}
+    if not os.path.exists(artists_file):
+        return rich
+    with open(artists_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("|", 4)
+            if len(parts) >= 2:
+                name = parts[1]
+                rich[name.lower()] = {
+                    "name": name,
+                    "count": parts[2] if len(parts) > 2 else "",
+                    "years": parts[3] if len(parts) > 3 else "",
+                    "samples": parts[4] if len(parts) > 4 else "",
+                }
+    return rich
+
+
+def _build_artist_list_text(artist_map, rich_data=None):
+    """Format numbered artist list for AI.
+
+    With rich_data: INDEX|NAME|N тр.|YEARS|sample1; sample2
+    Without:        INDEX|NAME
+    """
     lines = []
     num_to_key = {}
     for i, (key, info) in enumerate(sorted(artist_map.items()), start=1):
-        lines.append(f"{i}|{info['name']}")
         num_to_key[i] = key
+        if rich_data and key in rich_data:
+            r = rich_data[key]
+            parts = [str(i), r["name"]]
+            if r.get("count"):
+                parts.append(f"{r['count']} тр.")
+            if r.get("years"):
+                parts.append(r["years"])
+            if r.get("samples"):
+                parts.append(r["samples"])
+            lines.append("|".join(parts))
+        else:
+            lines.append(f"{i}|{info['name']}")
     return "\n".join(lines), num_to_key
 
 
-def _get_tracks_for_artists(selected_keys, artist_map, catalog_index, limit):
-    """Collect real catalog tracks for selected artists, capped at limit."""
+def _prededup_tracks(tracks):
+    """Remove Live/Remaster/Acoustic variants before sending to AI.
+
+    Keeps studio version when both studio and variant exist for the same
+    (artist, normalized_title) pair. If only a variant exists, keeps it.
+    Preserves the original order of studio tracks, then appends orphaned
+    variants (no studio equivalent found).
+    """
+    def _norm(title):
+        return _VARIANT_SUFFIX_RE.sub("", title).lower().strip()
+
+    studio, variants = [], []
+    for t in tracks:
+        if _VARIANT_SUFFIX_RE.search(t.get("title", "")):
+            variants.append(t)
+        else:
+            studio.append(t)
+
+    seen = set()
+    result = []
+    for t in studio:
+        key = f"{t.get('artist', '').lower()}|{_norm(t.get('title', ''))}"
+        if key not in seen:
+            seen.add(key)
+            result.append(t)
+    for t in variants:
+        key = f"{t.get('artist', '').lower()}|{_norm(t.get('title', ''))}"
+        if key not in seen:
+            seen.add(key)
+            result.append(t)
+    return result
+
+
+def _get_tracks_for_artists(selected_keys, artist_map, catalog_index,
+                             max_per_artist=MAX_TRACKS_PER_ARTIST):
+    """Collect tracks for selected artists with per-artist cap.
+
+    No global limit here — caller (``_merge_tracks_scored``) handles that.
+    Per-artist cap ensures no single artist dominates the final prompt even
+    when an artist has hundreds of tracks in the catalog.
+    """
     tracks = []
     for key in selected_keys:
         info = artist_map.get(key)
         if not info:
             continue
+        artist_tracks = []
         for idx in info["indices"]:
             track = catalog_index.get(idx)
             if track:
-                tracks.append({"index": idx, **track})
-    tracks.sort(key=lambda t: (t.get("artist", "").lower(), t.get("title", "").lower()))
-    return tracks[:limit]
+                artist_tracks.append({"index": idx, **track})
+        tracks.extend(artist_tracks[:max_per_artist])
+    return tracks
+
+
+def _merge_tracks_scored(artist_tracks, tfidf_tracks, limit,
+                          max_per_artist=MAX_TRACKS_PER_ARTIST):
+    """Merge artist tracks + TF-IDF results into a ranked, diverse candidate list.
+
+    Strategy:
+    1. Assign TF-IDF scores to all artist tracks (0.0 if not in TF-IDF results).
+    2. Pre-deduplicate: remove Live/Remaster/Acoustic variants.
+    3. Group by artist; sort each group by score (desc); cap at max_per_artist.
+    4. Sort artist groups by their best track's score so most relevant artists
+       appear first in the interleaved output.
+    5. Round-robin interleave: take slot-0 from each artist, then slot-1, etc.
+       This guarantees diversity even after hard truncation to ``limit``.
+
+    Result: a balanced list where no artist dominates AND the most relevant
+    tracks for the query appear near the top.
+    """
+    from collections import defaultdict
+
+    tfidf_score_map = {t["index"]: t.get("score", 0.0) for t in tfidf_tracks}
+
+    # Merge, preserving scores
+    seen = set()
+    all_tracks = []
+    for t in artist_tracks:
+        idx = t["index"]
+        if idx not in seen:
+            seen.add(idx)
+            all_tracks.append({**t, "score": tfidf_score_map.get(idx, 0.0)})
+    for t in tfidf_tracks:
+        idx = t["index"]
+        if idx not in seen:
+            seen.add(idx)
+            all_tracks.append(t)
+
+    # Pre-deduplicate variants
+    all_tracks = _prededup_tracks(all_tracks)
+
+    # Group by artist
+    by_artist = defaultdict(list)
+    for t in all_tracks:
+        by_artist[t.get("artist", "").lower()].append(t)
+
+    # Per-artist: sort by score, cap at max_per_artist
+    for key in by_artist:
+        by_artist[key].sort(key=lambda t: t.get("score", 0.0), reverse=True)
+        by_artist[key] = by_artist[key][:max_per_artist]
+
+    # Sort artist groups by their best track's score (most relevant first)
+    artist_groups = sorted(
+        by_artist.values(),
+        key=lambda g: g[0].get("score", 0.0) if g else 0.0,
+        reverse=True,
+    )
+
+    # Round-robin interleave across all artists
+    result = []
+    for slot in range(max_per_artist):
+        for group in artist_groups:
+            if slot < len(group):
+                result.append(group[slot])
+            if len(result) >= limit:
+                return result
+
+    return result[:limit]
 
 
 def _build_track_text(tracks):
@@ -472,12 +630,14 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
 
     artist_map = build_artist_index(catalog_index)
     num_artists = len(artist_map)
+    data_dir = os.path.dirname(os.path.abspath(catalog_path))
 
     # ---- Step 1: AI selects relevant artists --------------------------------
     if progress_cb:
         progress_cb(f"Шаг 1: отбор артистов из {num_artists} в каталоге...")
 
-    artist_list_text, num_to_key = _build_artist_list_text(artist_map)
+    rich_artist_data = _load_rich_artist_data(data_dir)
+    artist_list_text, num_to_key = _build_artist_list_text(artist_map, rich_artist_data)
     artist_user_msg = (
         f"Список артистов:\n{artist_list_text}\n\n"
         f"Запрос: \"{user_query}\"\n"
@@ -506,30 +666,28 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
             progress_cb("Шаг 1 не вернул артистов. Используем весь каталог.")
         selected_artist_keys = set(artist_map.keys())
 
-    # ---- Step 2b: TF-IDF for literal keyword matches (parallel) -------------
-    tfidf_indices = set()
+    # ---- Step 2b: TF-IDF for literal keyword matches ------------------------
     tfidf_tracks = []
     try:
         from search_local import SearchIndex
         if progress_cb:
             progress_cb("TF-IDF: поиск буквальных совпадений...")
         search_idx = SearchIndex.from_catalog_dict(catalog_index)
-        tfidf_results = search_idx.search(user_query, topn=TFIDF_CANDIDATES)
-        tfidf_indices = {r["index"] for r in tfidf_results}
-        tfidf_tracks = tfidf_results
+        tfidf_tracks = search_idx.search(user_query, topn=TFIDF_CANDIDATES)
     except ImportError:
         pass
 
-    # ---- Step 2: Collect real tracks + merge TF-IDF -------------------------
+    # ---- Step 2: Collect + score + merge tracks -----------------------------
+    # Per-artist cap + TF-IDF scoring + round-robin interleave ensure that:
+    # - No single artist dominates (AC/DC doesn't crowd out Beatles)
+    # - Most keyword-relevant tracks appear first (better for tight context windows)
+    # - Artist diversity is maintained even after truncation to TRACK_CONTEXT_LIMIT
     artist_tracks = _get_tracks_for_artists(
-        selected_artist_keys, artist_map, catalog_index, TRACK_CONTEXT_LIMIT
+        selected_artist_keys, artist_map, catalog_index
     )
-    artist_track_indices = {t["index"] for t in artist_tracks}
-    merged_tracks = list(artist_tracks)
-    for t in tfidf_tracks:
-        if t["index"] not in artist_track_indices:
-            merged_tracks.append(t)
-    merged_tracks = merged_tracks[:TRACK_CONTEXT_LIMIT]
+    merged_tracks = _merge_tracks_scored(
+        artist_tracks, tfidf_tracks, TRACK_CONTEXT_LIMIT
+    )
     step2_candidates = len(merged_tracks)
 
     if progress_cb:

@@ -1,9 +1,7 @@
 @echo off
-chcp 65001 > nul
-
 if not exist ".venv\Scripts\activate.bat" (
-    echo [ОШИБКА] Виртуальное окружение не найдено.
-    echo Сначала запустите setup_windows.bat
+    echo [ERROR] Virtual environment not found.
+    echo Please run setup_windows.bat first.
     pause
     exit /b 1
 )
@@ -12,6 +10,6 @@ call .venv\Scripts\activate.bat
 python main.py
 if errorlevel 1 (
     echo.
-    echo Приложение завершилось с ошибкой.
+    echo App exited with an error.
     pause
 )

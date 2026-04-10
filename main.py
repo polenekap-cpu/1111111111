@@ -553,7 +553,7 @@ class PlaylistApp(App):
 
     api_key       = StringProperty("")
     api_provider  = StringProperty("openrouter")
-    ai_model      = StringProperty("google/gemini-2.0-flash-lite-preview-02-05:free")
+    ai_model      = StringProperty("deepseek/deepseek-chat-v3-0324:free")
     music_dirs_edit = StringProperty("")
     output_dir    = StringProperty("")
     theme_name    = StringProperty("midnight")
@@ -572,7 +572,8 @@ class PlaylistApp(App):
         self._load_settings()
         self.set_theme(self.theme_name)
         self._update_catalog_stats()
-        return Builder.load_string(KV)
+        Builder.load_string(KV)
+        return RootWidget()
 
     def on_start(self):
         if platform == "android":
@@ -684,7 +685,7 @@ class PlaylistApp(App):
     def set_api_provider(self, provider):
         self.api_provider = provider
         defaults = {
-            "openrouter": "google/gemini-2.0-flash-lite-preview-02-05:free",
+            "openrouter": "deepseek/deepseek-chat-v3-0324:free",
             "google":     "gemini-2.0-flash",
         }
         self.ai_model = defaults.get(provider, self.ai_model)
@@ -773,9 +774,18 @@ class PlaylistApp(App):
             else:
                 self._generate_simple()
         except Exception as e:
-            status = f"Ошибка: {e}"
-            traceback.print_exc()
             err_text = str(e)
+            if "Provider returned error" in err_text:
+                err_text = (
+                    "Модель недоступна или вернула ошибку.\n\n"
+                    "Откройте вкладку Настройки и смените модель.\n"
+                    "Рабочие бесплатные модели OpenRouter:\n"
+                    "  deepseek/deepseek-chat-v3-0324:free\n"
+                    "  meta-llama/llama-3.3-70b-instruct:free\n"
+                    "  qwen/qwen3-235b-a22b:free"
+                )
+            status = f"Ошибка: {str(e)[:60]}"
+            traceback.print_exc()
             Clock.schedule_once(lambda dt: setattr(self, "results_text", err_text))
 
         Clock.schedule_once(lambda dt: self._end_busy(status))

@@ -1,0 +1,229 @@
+name: Build APK (16KB Page Alignment)
+
+on:
+  push:
+    branches: ["*"]
+  workflow_dispatch:
+
+# АРХИТЕКТУРА РЕШЕНИЯ
+# ===================
+# p4a полностью перезаписывает CFLAGS / CXXFLAGS / LDFLAGS в arch.get_env()
+# из своих internal-списков. Глобальные env-переменные GitHub Actions внутрь
+# рецептов НЕ попадают. Поэтому единственный надёжный способ добавить флаги
+# ко ВСЕМ компиляциям — обернуть сам компилятор.
+#
+# РЕШЕНИЕ: wrapper вокруг clang-17 (scripts/ndk-clang17-wrapper.sh)
+# ------------------------------------------------------------------
+# Все рецепты p4a используют одну цепочку вызовов:
+#
+#   get_recipe_env() → CC = ndk/bin/clang + cflags
+#   ndk/bin/clang     → shell-скрипт → exec ndk/bin/clang-17 "$@"
+#   ndk/bin/clang-17  → НАШ WRAPPER  → clang-17.real (реальный LLVM)
+#
+# Один wrapper перехватывает ВСЕ компиляции и линковки target-архитектуры:
+# Kivy, HarfBuzz, SDL2_ttf через ndk-build, FreeType и т.д.
+# Host-компилятор (GCC/x86_64 для hostpython3) этот бинарь не использует.
+#
+# Wrapper хранится в repo (scripts/ndk-clang17-wrapper.sh) — это решает
+# конфликт YAML/heredoc: heredoc внутри run: | требует, чтобы строки
+# closing-delimiter (WRAPPER) были на col=0, что YAML парсер интерпретирует
+# как завершение блока и падает с "Invalid workflow file".
+#
+# NDK кэшируется ВМЕСТЕ с установленным wrapper (ключ содержит версию
+# патча). При изменении wrapper достаточно поднять версию: v1 → v2.
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            autoconf \
+            automake \
+            build-essential \
+            ccache \
+            cmake \
+            git \
+            libffi-dev \
+            libssl-dev \
+            libtool \
+            lld \
+            pkg-config \
+            python3-pip \
+            unzip \
+            zip \
+            zlib1g-dev
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install "buildozer==1.5.0" "cython==0.29.33"
+          pip install --force-reinstall \
+            git+https://github.com/kivy/python-for-android.git@develop
+
+      # NDK r26b изменил ndk-build: "Module X depends on undefined modules: Y"
+      # стало ФАТАЛЬНОЙ ошибкой (в r25b — только warning). Это ломает сборку
+      # libSDL2.so когда модуль python_shared не объявлен в Application.mk.
+      # APP_ALLOW_MISSING_DEPS := true — официальный флаг NDK (r21+):
+      # разрешает продолжать при отсутствии зависимых модулей.
+      # python_shared загружается через dlopen() в рантайме, не линкуется
+      # статически, поэтому это безопасно.
+      - name: Patch p4a SDL Application.mk (NDK r26b missing deps fix)
+        run: |
+          APP_MK=$(python3 -c "
+          import pythonforandroid.bootstraps._sdl_common as m, os
+          print(os.path.join(os.path.dirname(m.__file__), 'build/jni/Application.mk'))
+          ")
+          echo "Target: $APP_MK"
+          if grep -q "APP_ALLOW_MISSING_DEPS" "$APP_MK"; then
+            echo "Already patched"
+          else
+            printf '\n# NDK r26b: treat undefined module deps as non-fatal\nAPP_ALLOW_MISSING_DEPS := true\n' >> "$APP_MK"
+            echo "Patch applied:"
+            cat "$APP_MK"
+          fi
+
+      # NDK кэшируется отдельно с фиксированным ключом, включающим версию
+      # патча. При cache-hit NDK придёт уже с wrapper внутри — шаг
+      # "Patch NDK clang-17" проверит .real и ничего не сделает.
+      # restore-keys намеренно отсутствует: нужен точный хит чтобы
+      # не получить NDK без wrapper из частичного совпадения.
+      - name: Cache NDK r26b (pre-patched)
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildozer/android/platform/android-ndk-r26b
+          key: ndk-r26b-linux-clang17-16kb-v1
+
+      - name: Download NDK r26b
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          echo "Cache miss — downloading NDK r26b (~800 MB)..."
+          mkdir -p ~/.buildozer/android/platform
+          wget --progress=dot:giga \
+            "https://dl.google.com/android/repository/android-ndk-r26b-linux.zip" \
+            -O /tmp/ndk-r26b.zip
+          echo "Extracting..."
+          unzip -q /tmp/ndk-r26b.zip -d ~/.buildozer/android/platform/
+          rm /tmp/ndk-r26b.zip
+          echo "NDK r26b ready."
+
+      # Устанавливает wrapper из scripts/ndk-clang17-wrapper.sh.
+      # Шаг идемпотентен: при наличии clang-17.real просто пишет "OK".
+      # Wrapper хранится в репо (а не heredoc в YAML) чтобы избежать
+      # синтаксической ошибки: YAML literal block (run: |) завершается
+      # при обнаружении строки с отступом меньше базового, поэтому
+      # closing-delimiter heredoc на col=0 ломает парсинг YAML.
+      - name: Patch NDK clang-17 (Clang17 compat + 16KB page size)
+        run: |
+          CLANG_BIN="$HOME/.buildozer/android/platform/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          REAL_BIN="$CLANG_BIN/clang-17"
+
+          if [ ! -f "$REAL_BIN" ]; then
+            echo "::error::clang-17 not found at $REAL_BIN"
+            echo "Contents of CLANG_BIN:"
+            ls "$CLANG_BIN" 2>/dev/null || echo "(directory missing)"
+            exit 1
+          fi
+
+          if [ -f "${REAL_BIN}.real" ]; then
+            echo "clang-17 already wrapped (cache hit) — OK"
+            exit 0
+          fi
+
+          mv "$REAL_BIN" "${REAL_BIN}.real"
+          cp scripts/ndk-clang17-wrapper.sh "$REAL_BIN"
+          chmod +x "$REAL_BIN"
+          echo "clang-17 wrapper installed: $REAL_BIN"
+          echo "Original binary: ${REAL_BIN}.real"
+
+      # Кэшируем всё кроме NDK (NDK в отдельном кэше выше).
+      # android-sdk-23 был неверным именем — buildozer кладёт SDK в
+      # ~/.buildozer/android/platform/android-sdk-XXXX, имя зависит
+      # от версии инструментов. Кэшируем весь ~/.buildozer чтобы
+      # захватить SDK независимо от версии.
+      # NDK из этого кэша игнорируется: если кэш NDK (выше) дал хит —
+      # wrapper уже на месте; если нет — NDK скачивается заново и патчится.
+      - name: Cache Buildozer (SDK + packages + dists)
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildozer
+          key: buildozer-v5-${{ runner.os }}-${{ hashFiles('buildozer.spec', 'p4a-recipes/**/*.py') }}
+          restore-keys: |
+            buildozer-v5-${{ runner.os }}-
+
+      - name: Verify setup before build
+        run: |
+          echo "=== Checking wrapper ==="
+          WRAPPER="$HOME/.buildozer/android/platform/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin/clang-17"
+          test -x "$WRAPPER"         && echo "OK: clang-17 wrapper executable"   || { echo "FAIL: clang-17 not found"; exit 1; }
+          test -f "${WRAPPER}.real"  && echo "OK: clang-17.real original present" || { echo "FAIL: .real not found";   exit 1; }
+
+          echo "=== Checking local recipes ==="
+          test -f "p4a-recipes/sdl2_ttf/__init__.py" && echo "OK: sdl2_ttf recipe"  || { echo "FAIL"; exit 1; }
+          test -f "p4a-recipes/harfbuzz/__init__.py"  && echo "OK: harfbuzz recipe"  || { echo "FAIL"; exit 1; }
+          grep -q "p4a.local_recipes" buildozer.spec  && echo "OK: local_recipes in spec" || { echo "FAIL"; exit 1; }
+
+      - name: Build APK
+        run: |
+          yes | buildozer -v android debug
+
+      - name: Verify 16 KB ELF alignment
+        continue-on-error: true
+        run: |
+          APK=$(ls bin/*.apk 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::No APK found in bin/"
+            exit 1
+          fi
+          echo "Checking: $APK"
+          UNZIP_DIR=$(mktemp -d)
+          unzip -q "$APK" "lib/arm64-v8a/*.so" -d "$UNZIP_DIR" || true
+
+          OBJDUMP="$HOME/.buildozer/android/platform/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objdump"
+          FAILED=0
+          for SO in "$UNZIP_DIR/lib/arm64-v8a/"*.so; do
+            [ -f "$SO" ] || continue
+            ALIGN=$("$OBJDUMP" -p "$SO" 2>/dev/null \
+              | grep -oP '(?<=align 2\*\*)\d+' | sort -n | head -1)
+            if [ -n "$ALIGN" ] && [ "$ALIGN" -lt 14 ]; then
+              echo "WARN: $(basename "$SO") — align 2**${ALIGN} (need 2**14)"
+              FAILED=1
+            else
+              echo "OK:   $(basename "$SO") — align 2**${ALIGN:-?}"
+            fi
+          done
+          [ $FAILED -eq 0 ] || echo "::warning::Some .so files not 16 KB aligned — see log."
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI-Playlist-16KB-APK
+          path: bin/*.apk
+          retention-days: 30
+
+      - name: Create release on tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bin/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

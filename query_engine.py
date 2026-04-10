@@ -28,8 +28,8 @@ import requests
 
 ARTIST_SELECT_PROMPT = """\
 Тебе дан пронумерованный список артистов из локальной музыкальной библиотеки.
-Формат строки: INDEX|АРТИСТ|КОЛ-ВО ТРЕКОВ|ГОДЫ|ПРИМЕРЫ ТРЕКОВ
-(некоторые поля могут отсутствовать)
+Формат строки: INDEX|АРТИСТ|КОЛ-ВО ТРЕКОВ|ГОДЫ|ПРИМЕРЫ ТРЕКОВ|ЖАНРЫ|ПОПУЛЯРНОСТЬ
+(поля ЖАНРЫ и ПОПУЛЯРНОСТЬ присутствуют только если есть данные Last.fm)
 
 Задача: выбери артистов, у которых НАИБОЛЕЕ ВЕРОЯТНО есть треки, подходящие под запрос пользователя.
 Учитывай жанр, стиль, язык, настроение и эпоху. Выбирай щедро — лучше взять лишних, чем пропустить нужных.
@@ -444,28 +444,49 @@ def _load_rich_artist_data(data_dir):
     return rich
 
 
-def _build_artist_list_text(artist_map, rich_data=None):
+def _build_artist_list_text(artist_map, rich_data=None, lastfm_cache=None):
     """Format numbered artist list for AI.
 
-    With rich_data: INDEX|NAME|N тр.|YEARS|sample1; sample2
-    Without:        INDEX|NAME
+    Columns (all optional after INDEX|NAME):
+      N тр. | YEARS | sample titles | lastfm tags | listeners
+
+    With Last.fm data the AI can make genre-aware and popularity-aware
+    decisions even for artists it doesn't recognise by name.
     """
+    try:
+        from lastfm_enricher import format_listeners
+    except ImportError:
+        def format_listeners(n):
+            return f"{n // 1_000}K слуш." if n >= 1_000 else ""
+
     lines = []
     num_to_key = {}
     for i, (key, info) in enumerate(sorted(artist_map.items()), start=1):
         num_to_key[i] = key
+        parts = [str(i), info["name"]]
+
+        # Catalog-derived context (years, track count, sample titles)
         if rich_data and key in rich_data:
             r = rich_data[key]
-            parts = [str(i), r["name"]]
             if r.get("count"):
                 parts.append(f"{r['count']} тр.")
             if r.get("years"):
                 parts.append(r["years"])
             if r.get("samples"):
                 parts.append(r["samples"])
-            lines.append("|".join(parts))
-        else:
-            lines.append(f"{i}|{info['name']}")
+
+        # Last.fm enrichment (genre tags + popularity)
+        if lastfm_cache:
+            lfm = lastfm_cache.get(key, {})
+            tags = lfm.get("tags", [])
+            listeners = lfm.get("listeners", 0)
+            if tags:
+                parts.append(", ".join(tags[:5]))
+            ls = format_listeners(listeners)
+            if ls:
+                parts.append(ls)
+
+        lines.append("|".join(parts))
     return "\n".join(lines), num_to_key
 
 
@@ -525,7 +546,8 @@ def _get_tracks_for_artists(selected_keys, artist_map, catalog_index,
 
 
 def _merge_tracks_scored(artist_tracks, tfidf_tracks, limit,
-                          max_per_artist=MAX_TRACKS_PER_ARTIST):
+                          max_per_artist=MAX_TRACKS_PER_ARTIST,
+                          lastfm_cache=None):
     """Merge artist tracks + TF-IDF results into a ranked, diverse candidate list.
 
     Strategy:
@@ -571,12 +593,16 @@ def _merge_tracks_scored(artist_tracks, tfidf_tracks, limit,
         by_artist[key].sort(key=lambda t: t.get("score", 0.0), reverse=True)
         by_artist[key] = by_artist[key][:max_per_artist]
 
-    # Sort artist groups by their best track's score (most relevant first)
-    artist_groups = sorted(
-        by_artist.values(),
-        key=lambda g: g[0].get("score", 0.0) if g else 0.0,
-        reverse=True,
-    )
+    # Sort artist groups: primary = best TF-IDF score, secondary = Last.fm
+    # listener count.  When TF-IDF scores are all 0 (e.g. "самые популярные"),
+    # listener count decides the order → Beatles (7.8M) before niche acts.
+    def _sort_key(group):
+        tfidf_score = group[0].get("score", 0.0) if group else 0.0
+        artist_key  = group[0].get("artist", "").lower() if group else ""
+        listeners   = (lastfm_cache or {}).get(artist_key, {}).get("listeners", 0)
+        return (tfidf_score, listeners)
+
+    artist_groups = sorted(by_artist.values(), key=_sort_key, reverse=True)
 
     # Round-robin interleave across all artists
     result = []
@@ -637,7 +663,15 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
         progress_cb(f"Шаг 1: отбор артистов из {num_artists} в каталоге...")
 
     rich_artist_data = _load_rich_artist_data(data_dir)
-    artist_list_text, num_to_key = _build_artist_list_text(artist_map, rich_artist_data)
+    try:
+        from lastfm_enricher import load_cache as _load_lastfm
+        lastfm_cache = _load_lastfm(data_dir)
+    except ImportError:
+        lastfm_cache = {}
+
+    artist_list_text, num_to_key = _build_artist_list_text(
+        artist_map, rich_artist_data, lastfm_cache
+    )
     artist_user_msg = (
         f"Список артистов:\n{artist_list_text}\n\n"
         f"Запрос: \"{user_query}\"\n"
@@ -686,7 +720,8 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
         selected_artist_keys, artist_map, catalog_index
     )
     merged_tracks = _merge_tracks_scored(
-        artist_tracks, tfidf_tracks, TRACK_CONTEXT_LIMIT
+        artist_tracks, tfidf_tracks, TRACK_CONTEXT_LIMIT,
+        lastfm_cache=lastfm_cache,
     )
     step2_candidates = len(merged_tracks)
 

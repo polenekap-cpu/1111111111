@@ -1,54 +1,50 @@
 @echo off
-chcp 65001 > nul
 echo ============================================
-echo   AI Playlist Generator — Windows Setup
+echo   AI Playlist Generator - Windows Setup
 echo ============================================
 echo.
 
-:: Check Python
 python --version > nul 2>&1
 if errorlevel 1 (
-    echo [ОШИБКА] Python не найден.
-    echo Скачайте Python 3.10 или 3.11 с https://www.python.org/downloads/
-    echo При установке ОБЯЗАТЕЛЬНО поставьте галочку "Add Python to PATH"
+    echo [ERROR] Python not found.
+    echo Download Python 3.10 or 3.11 from https://www.python.org/downloads/
+    echo Make sure to check "Add Python to PATH" during installation.
     pause
     exit /b 1
 )
 
 for /f "tokens=2" %%v in ('python --version 2^>^&1') do set PYVER=%%v
-echo [OK] Python %PYVER%
+echo [OK] Python %PYVER% found.
 echo.
 
-:: Create venv
 if not exist ".venv" (
-    echo Создаём виртуальное окружение...
+    echo Creating virtual environment...
     python -m venv .venv
     if errorlevel 1 (
-        echo [ОШИБКА] Не удалось создать виртуальное окружение.
+        echo [ERROR] Failed to create virtual environment.
         pause
         exit /b 1
     )
-    echo [OK] Виртуальное окружение создано.
+    echo [OK] Virtual environment created.
 ) else (
-    echo [OK] Виртуальное окружение уже существует.
+    echo [OK] Virtual environment already exists.
 )
 echo.
 
-:: Activate venv and install deps
-echo Устанавливаем зависимости (может занять 1-3 минуты)...
+echo Installing dependencies (may take 1-3 minutes)...
 call .venv\Scripts\activate.bat
 python -m pip install --upgrade pip --quiet
 pip install -r requirements.txt
 if errorlevel 1 (
-    echo [ОШИБКА] Не удалось установить зависимости.
+    echo [ERROR] Failed to install dependencies.
     pause
     exit /b 1
 )
+
 echo.
-echo [OK] Все зависимости установлены.
+echo [OK] All dependencies installed.
 echo.
 echo ============================================
-echo   Установка завершена!
-echo   Теперь запускайте приложение через run.bat
+echo   Setup complete! Run the app via run.bat
 echo ============================================
 pause

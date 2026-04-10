@@ -572,7 +572,8 @@ class PlaylistApp(App):
         self._load_settings()
         self.set_theme(self.theme_name)
         self._update_catalog_stats()
-        return Builder.load_string(KV)
+        Builder.load_string(KV)
+        return RootWidget()
 
     def on_start(self):
         if platform == "android":

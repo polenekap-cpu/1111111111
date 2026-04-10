@@ -1,0 +1,12 @@
+{
+    "music_dirs": [
+        "/storage/emulated/0/Music"
+    ],
+    "catalog_path": "catalog.tsv",
+    "ai_catalog_path": "catalog_for_ai.txt",
+    "output_dir": "/storage/emulated/0/Music/Playlists",
+    "api_provider": "openrouter",
+    "ai_model": "google/gemini-2.0-flash-lite-preview-02-05:free",
+    "playlist_size": 15,
+    "theme": "midnight"
+}

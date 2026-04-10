@@ -1,0 +1,12 @@
+{
+  "music_dirs": [
+    "/path/to/your/music"
+  ],
+  "catalog_path": "/path/to/catalog.tsv",
+  "ai_catalog_path": "/path/to/catalog_for_ai.txt",
+  "output_dir": "/path/to/output",
+  "model": "stepfun/step-3.5-flash:free",
+  "playlist_size": 15,
+  "theme": "midnight",
+  "last_query": ""
+}

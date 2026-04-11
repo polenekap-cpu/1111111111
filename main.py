@@ -320,6 +320,18 @@ KV = '''
             background_color: app.theme.get('success', (0.55,0.8,0.55,1))
 
         RoundedButton:
+            text: 'Обогатить с MusicBrainz'
+            on_release: app.scan_musicbrainz()
+            disabled: app.is_busy
+            background_color: (0.45, 0.35, 0.75, 1)
+
+        RoundedButton:
+            text: 'Акустический анализ (librosa)'
+            on_release: app.scan_audio()
+            disabled: app.is_busy
+            background_color: (0.20, 0.55, 0.55, 1)
+
+        RoundedButton:
             text: 'Очистить каталог'
             on_release: app.clear_catalog()
             background_color: app.theme.get('error', (0.9,0.3,0.3,1))
@@ -797,6 +809,91 @@ class PlaylistApp(App):
             msg = f"Last.fm: обогащено {new_entries} артистов"
         except Exception as e:
             msg = f"Ошибка Last.fm: {e}"
+            traceback.print_exc()
+
+        Clock.schedule_once(lambda dt: self._end_busy(msg))
+
+    def scan_musicbrainz(self):
+        """Incrementally enrich catalog with MusicBrainz instrument data."""
+        if self.is_busy:
+            return
+        catalog_path = os.path.join(_app_data_dir(), "catalog.tsv")
+        if not os.path.exists(catalog_path):
+            self.scan_status = "Сначала выполните сканирование библиотеки"
+            return
+        self.is_busy = True
+        self.progress_value = 0
+        self.scan_status = "Запуск обогащения с MusicBrainz..."
+        threading.Thread(target=self._mb_thread, daemon=True).start()
+
+    def _mb_thread(self):
+        def update_progress(curr, total, msg):
+            Clock.schedule_once(lambda dt: self._sync_progress(curr, total, msg))
+
+        try:
+            import query_engine
+            import musicbrainz_enricher
+
+            self._write_config()
+            cfg = query_engine.load_config(_config_path())
+            catalog_index = query_engine.load_catalog_index(cfg["catalog_path"])
+            if not catalog_index:
+                raise ValueError("Каталог пуст")
+
+            data_dir = os.path.dirname(os.path.abspath(cfg["catalog_path"]))
+            cache = musicbrainz_enricher.enrich_catalog_mb(
+                catalog_index,
+                data_dir,
+                progress_cb=update_progress,
+                max_tracks=300,  # ~5 min per batch (1 req/s)
+            )
+            entries_with_data = sum(
+                1 for v in cache.values() if v.get("instruments") or v.get("tags")
+            )
+            msg = f"MusicBrainz: {entries_with_data} треков с данными (всего в кэше {len(cache)})"
+        except Exception as e:
+            msg = f"Ошибка MusicBrainz: {e}"
+            traceback.print_exc()
+
+        Clock.schedule_once(lambda dt: self._end_busy(msg))
+
+    def scan_audio(self):
+        """Run librosa acoustic analysis on the local catalog."""
+        if self.is_busy:
+            return
+        catalog_path = os.path.join(_app_data_dir(), "catalog.tsv")
+        if not os.path.exists(catalog_path):
+            self.scan_status = "Сначала выполните сканирование библиотеки"
+            return
+        self.is_busy = True
+        self.progress_value = 0
+        self.scan_status = "Запуск акустического анализа..."
+        threading.Thread(target=self._audio_thread, daemon=True).start()
+
+    def _audio_thread(self):
+        def update_progress(curr, total, msg):
+            Clock.schedule_once(lambda dt: self._sync_progress(curr, total, msg))
+
+        try:
+            import query_engine
+            import audio_analyzer
+
+            self._write_config()
+            cfg = query_engine.load_config(_config_path())
+            catalog_index = query_engine.load_catalog_index(cfg["catalog_path"])
+            if not catalog_index:
+                raise ValueError("Каталог пуст")
+
+            data_dir = os.path.dirname(os.path.abspath(cfg["catalog_path"]))
+            features = audio_analyzer.analyze_catalog(
+                catalog_index,
+                data_dir,
+                progress_cb=update_progress,
+            )
+            analysed = sum(1 for v in features.values() if v)
+            msg = f"Акустический анализ: {analysed} треков проанализировано"
+        except Exception as e:
+            msg = f"Ошибка анализа аудио: {e}"
             traceback.print_exc()
 
         Clock.schedule_once(lambda dt: self._end_busy(msg))

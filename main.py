@@ -841,16 +841,35 @@ class PlaylistApp(App):
                 raise ValueError("Каталог пуст")
 
             data_dir = os.path.dirname(os.path.abspath(cfg["catalog_path"]))
-            cache = musicbrainz_enricher.enrich_catalog_mb(
+
+            # Count total unique artists before enrichment
+            unique_artists = len({
+                t.get("artist", "").strip().lower()
+                for t in catalog_index.values()
+                if t.get("artist", "").strip()
+            })
+
+            cache, stats = musicbrainz_enricher.enrich_catalog_mb(
                 catalog_index,
                 data_dir,
                 progress_cb=update_progress,
-                max_artists=300,  # ~5 min per batch (1 req/s)
+                max_artists=400,   # ~7 min per batch; press again to continue
             )
-            entries_with_data = sum(
-                1 for v in cache.values() if v.get("instruments") or v.get("tags")
-            )
-            msg = f"MusicBrainz: {entries_with_data} треков с данными (всего в кэше {len(cache)})"
+            processed  = stats.get("processed",  0)
+            remaining  = stats.get("remaining",   0)
+            with_data  = stats.get("with_instr",  0)
+
+            if remaining > 0:
+                msg = (
+                    f"MusicBrainz: обработано {processed} из {unique_artists} артистов "
+                    f"({with_data} треков с данными). "
+                    f"Осталось ~{remaining} — нажмите кнопку ещё раз."
+                )
+            else:
+                msg = (
+                    f"MusicBrainz: готово! Все {unique_artists} артистов проверены. "
+                    f"{with_data} треков с данными об инструментах."
+                )
         except Exception as e:
             msg = f"Ошибка MusicBrainz: {e}"
             traceback.print_exc()

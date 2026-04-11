@@ -31,23 +31,36 @@ Parse the user's music query (may be in Russian or English) into a JSON structur
 Respond with ONLY a single JSON object on one line, no explanation, no markdown.
 
 Schema (all fields required; use null when unknown):
-{"genres":[],"mood":null,"energy":"medium","bpm_min":null,"bpm_max":null,"vocal":"any","mode":"any","language":null}
+{"genres":[],"mood":null,"energy":"medium","bpm_min":null,"bpm_max":null,"vocal":"any","mode":"any","language":null,"search_hint":null}
 
 Field rules:
-- genres:   list of genre names in English, e.g. ["rock","heavy metal"]
-- mood:     single English word/phrase, e.g. "melancholic", "energetic", "relaxing"
-- energy:   "low" | "medium" | "high"
-- bpm_min / bpm_max: integer BPM bounds or null
-- vocal:    "any" | "vocal" | "instrumental"
-- mode:     "any" | "major" | "minor"
-- language: null | "ru" | "en" | "fr" | "ja" | "ko" | "es"
+- genres:      list of genre names in English, e.g. ["rock","heavy metal"]
+- mood:        single English word/phrase, e.g. "melancholic", "energetic", "relaxing"
+- energy:      "low" | "medium" | "high"
+- bpm_min/max: integer BPM bounds or null; for "fastest tempo" set bpm_min:180
+- vocal:       "any" | "vocal" | "instrumental"
+- mode:        "any" | "major" | "minor"
+- language:    null | "ru" | "en" | "fr" | "ja" | "ko" | "es"
+- search_hint: SHORT English phrase optimised for a music search engine.
+  Translate idioms, cultural references and vibes into searchable terms.
+  This is the single most important field — make it specific and evocative.
+  Examples:
+    "противный дед"           → "grumpy raspy male vocalist russian bard folk"
+    "вайб ночного города"     → "dark city night atmospheric synthwave"
+    "100 самых популярных"    → "greatest hits all time most popular"
+    "медитация перед сном"    → "sleep meditation ambient calm"
+    "быстрый темп"            → "high bpm fast tempo thrash death metal"
+    "неофолк спокойный"       → "neofolk pagan folk calm medieval acoustic"
 
-Examples:
+Examples (full):
   Query: "расслабляющая инструментальная музыка с флейтой"
-  → {"genres":["new age","classical"],"mood":"relaxing","energy":"low","bpm_min":null,"bpm_max":90,"vocal":"instrumental","mode":"any","language":null}
+  → {"genres":["new age","classical"],"mood":"relaxing","energy":"low","bpm_min":null,"bpm_max":90,"vocal":"instrumental","mode":"any","language":null,"search_hint":"flute instrumental relaxing new age classical"}
 
   Query: "energetic metal from the 80s"
-  → {"genres":["heavy metal","hard rock"],"mood":"energetic","energy":"high","bpm_min":140,"bpm_max":null,"vocal":"vocal","mode":"any","language":"en"}"""
+  → {"genres":["heavy metal","hard rock"],"mood":"energetic","energy":"high","bpm_min":140,"bpm_max":null,"vocal":"vocal","mode":"any","language":"en","search_hint":"heavy metal hard rock 80s energetic"}
+
+  Query: "спокойный неофолк"
+  → {"genres":["neofolk","pagan folk","medieval folk"],"mood":"calm","energy":"low","bpm_min":null,"bpm_max":100,"vocal":"any","mode":"any","language":null,"search_hint":"neofolk pagan folk calm acoustic medieval"}"""
 
 ARTIST_SELECT_PROMPT = """\
 Тебе дан пронумерованный список артистов из локальной музыкальной библиотеки.
@@ -63,20 +76,22 @@ ARTIST_SELECT_PROMPT = """\
 
 TRACK_SELECT_PROMPT = """\
 Ты — музыкальный куратор. Тебе дан список реальных треков из локального каталога.
-Формат: INDEX|АРТИСТ|НАЗВАНИЕ|ГОД
+Формат: INDEX|АРТИСТ|НАЗВАНИЕ|ГОД  (иногда с дополнительной колонкой BPM:XXX — темп трека)
 
 Задача: выбери до N треков, которые НАИЛУЧШИМ ОБРАЗОМ соответствуют запросу.
 
 Правила:
 - Используй свои знания о каждом треке и артисте: жанр, инструменты, наличие вокала,
   настроение, язык — даже если это явно не указано в названии.
+- Если в строке трека есть колонка BPM — используй реальные значения темпа для сортировки,
+  особенно для запросов типа «быстрый темп», «самый медленный» и т.д.
 - Если запрос про инструментальную музыку или конкретный инструмент (флейта, скрипка и т.д.)
   — выбирай треки, которые, по твоим знаниям, действительно содержат этот инструмент или
   не содержат вокала. Если таких нет в списке — верни пустой плейлист.
 - Если запрос называет конкретного исполнителя — включай ТОЛЬКО треки этого исполнителя.
 - Соблюдай язык запроса: «на русском» → кириллические треки, «in english» → латиница.
 - НЕ дублируй: если есть «Song (Live)» и «Song» — только студийную версию.
-- Не ставь подряд треки одного артиста (если не запрошен конкретный артист).
+- Разнообразие: не концентрируй больше 20–25% треков у одного артиста, если не запрошен конкретный исполнитель.
 - Лучше меньше, но точнее. Лучше 5 релевантных треков, чем 30 сомнительных.
 
 Ответ: верни ТОЛЬКО индексы через запятую внутри тегов <PLAYLIST> и </PLAYLIST>.
@@ -320,6 +335,7 @@ _DECOMPOSE_DEFAULT = {
     "genres": [], "mood": None, "energy": "medium",
     "bpm_min": None, "bpm_max": None,
     "vocal": "any", "mode": "any", "language": None,
+    "search_hint": None,
 }
 
 
@@ -365,13 +381,14 @@ def decompose_query(
         result["mood"]     = parsed.get("mood") or None
         energy = parsed.get("energy", "medium")
         result["energy"]   = energy if energy in ("low", "medium", "high") else "medium"
-        result["bpm_min"]  = int(parsed["bpm_min"])  if parsed.get("bpm_min")  else None
-        result["bpm_max"]  = int(parsed["bpm_max"])  if parsed.get("bpm_max")  else None
+        result["bpm_min"]     = int(parsed["bpm_min"])  if parsed.get("bpm_min")  else None
+        result["bpm_max"]     = int(parsed["bpm_max"])  if parsed.get("bpm_max")  else None
         vocal = parsed.get("vocal", "any")
-        result["vocal"]    = vocal  if vocal  in ("any", "vocal", "instrumental") else "any"
+        result["vocal"]       = vocal  if vocal  in ("any", "vocal", "instrumental") else "any"
         mode  = parsed.get("mode",  "any")
-        result["mode"]     = mode   if mode   in ("any", "major", "minor")        else "any"
-        result["language"] = parsed.get("language") or None
+        result["mode"]        = mode   if mode   in ("any", "major", "minor")        else "any"
+        result["language"]    = parsed.get("language") or None
+        result["search_hint"] = (parsed.get("search_hint") or "").strip() or None
         return result
 
     except Exception as exc:
@@ -645,7 +662,8 @@ def _get_tracks_for_artists(selected_keys, artist_map, catalog_index,
 def _merge_tracks_scored(artist_tracks, tfidf_tracks, limit,
                           max_per_artist=MAX_TRACKS_PER_ARTIST,
                           lastfm_cache=None,
-                          mb_priority_indices=None):
+                          mb_priority_indices=None,
+                          online_boost_map=None):
     """Merge artist tracks + TF-IDF results into a ranked, diverse candidate list.
 
     Strategy:
@@ -666,6 +684,7 @@ def _merge_tracks_scored(artist_tracks, tfidf_tracks, limit,
 
     tfidf_score_map   = {t["index"]: t.get("score", 0.0) for t in tfidf_tracks}
     mb_priority_set   = set(mb_priority_indices or [])
+    online_map        = online_boost_map or {}
     MB_BOOST          = 20.0   # score assigned to MB-confirmed tracks
 
     # Merge, preserving scores
@@ -678,6 +697,8 @@ def _merge_tracks_scored(artist_tracks, tfidf_tracks, limit,
             base_score = tfidf_score_map.get(idx, 0.0)
             if idx in mb_priority_set:
                 base_score = max(base_score, MB_BOOST)
+            if idx in online_map:
+                base_score = max(base_score, online_map[idx])
             all_tracks.append({**t, "score": base_score})
     for t in tfidf_tracks:
         idx = t["index"]
@@ -686,6 +707,8 @@ def _merge_tracks_scored(artist_tracks, tfidf_tracks, limit,
             score = t.get("score", 0.0)
             if idx in mb_priority_set:
                 score = max(score, MB_BOOST)
+            if idx in online_map:
+                score = max(score, online_map[idx])
             all_tracks.append({**t, "score": score})
 
     # Pre-deduplicate variants
@@ -724,10 +747,41 @@ def _merge_tracks_scored(artist_tracks, tfidf_tracks, limit,
     return result[:limit]
 
 
-def _build_track_text(tracks):
+def _enforce_diversity(tracks: list, max_per_artist: int) -> list:
+    """Hard cap: no more than max_per_artist tracks from the same artist.
+
+    Applied as a post-processing step on the AI-selected playlist so that
+    a single well-known artist can never crowd out others regardless of
+    how the AI ranked them.
+    """
+    from collections import defaultdict
+    counts: dict = defaultdict(int)
+    result = []
+    for t in tracks:
+        a = t.get("artist", "").lower().strip()
+        if counts[a] < max_per_artist:
+            counts[a] += 1
+            result.append(t)
+    return result
+
+
+def _build_track_text(tracks, audio_features=None):
+    """Format track list for the Step-2 AI prompt.
+
+    Appends a BPM column when audio_features are available and any track
+    has BPM data.  The AI can use this to sort/filter by actual tempo.
+    Format: INDEX|ARTIST|TITLE|YEAR  or  INDEX|ARTIST|TITLE|YEAR|BPM:120
+    """
     lines = []
     for t in tracks:
-        lines.append(f"{t['index']}|{t.get('artist','')}|{t.get('title','')}|{t.get('year','')}")
+        line = f"{t['index']}|{t.get('artist','')}|{t.get('title','')}|{t.get('year','')}"
+        if audio_features:
+            path  = t.get("path", "")
+            feats = audio_features.get(path) or {}
+            bpm   = feats.get("bpm", 0)
+            if bpm and bpm > 0:
+                line += f"|BPM:{bpm:.0f}"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -860,6 +914,8 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
             hint_lines.append("Тип: инструментальная музыка (без вокала)")
         if structured_intent.get("language"):
             hint_lines.append(f"Язык: {structured_intent['language']}")
+        if structured_intent.get("search_hint"):
+            hint_lines.append(f"Поисковая подсказка: {structured_intent['search_hint']}")
 
         hint_block = ("\nКонтекст запроса:\n" + "\n".join(hint_lines) + "\n") if hint_lines else ""
 
@@ -975,17 +1031,75 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
         except ImportError:
             pass
 
+    # ---- Step 2e: Online search cross-reference ----------------------------
+    # Query Deezer/iTunes (no API key) with the user's request and/or the
+    # AI-generated search_hint.  Any online result that matches a local
+    # track gets an ONLINE_BOOST score so it rises in the candidate list.
+    # This helps queries like "100 популярных песен" or "вайб противного деда"
+    # where TF-IDF returns nothing useful (no keyword in artist/title).
+    online_boost_map: dict = {}
+    if cfg.get("online_search_enabled", True):
+        try:
+            import online_searcher
+            import time as _time
+
+            search_hint = structured_intent.get("search_hint") or ""
+            raw_queries = online_searcher.form_search_queries(
+                user_query, structured_intent
+            )
+            # Prepend the AI-generated search_hint as the highest-priority query
+            if search_hint and search_hint not in raw_queries:
+                raw_queries = [search_hint] + raw_queries[:2]
+            online_queries = raw_queries[:2]   # cap at 2 API calls
+
+            if progress_cb:
+                progress_cb(f"Онлайн-поиск: {', '.join(online_queries[:1])}...")
+
+            online_tracks: list = []
+            for i, q in enumerate(online_queries):
+                if i > 0:
+                    _time.sleep(online_searcher._DEEZER_INTERVAL)
+                hits = online_searcher.search_deezer(q)
+                if not hits:
+                    hits = online_searcher.search_itunes(q)
+                online_tracks.extend(hits[:50])
+
+            if online_tracks:
+                online_boost_map = online_searcher.match_to_catalog(
+                    online_tracks, catalog_index
+                )
+                if progress_cb and online_boost_map:
+                    progress_cb(
+                        f"Онлайн: {len(online_boost_map)} совпадений в каталоге"
+                    )
+        except Exception as _exc:
+            print(f"[online_searcher] skipped: {_exc}", file=sys.stderr)
+
+    # ---- BPM sort for extreme-tempo queries --------------------------------
+    # When the user asks for "fastest/slowest tempo" and audio_features.json
+    # has data, pre-sort artist_tracks by BPM so the AI sees the extremes
+    # near the top of the candidate list even without knowing each band.
+    has_max_bpm = "max_bpm" in query_attributes
+    has_min_bpm = "min_bpm" in query_attributes
+    if audio_features and (has_max_bpm or has_min_bpm):
+        def _bpm_sort_key(t):
+            feats = audio_features.get(t.get("path", "")) or {}
+            b = feats.get("bpm", 0.0)
+            return b if b > 0 else (0.0 if has_max_bpm else 9999.0)
+        artist_tracks.sort(key=_bpm_sort_key, reverse=has_max_bpm)
+
     merged_tracks = _merge_tracks_scored(
         artist_tracks, tfidf_tracks, TRACK_CONTEXT_LIMIT,
         lastfm_cache=lastfm_cache,
         mb_priority_indices=mb_priority_indices,
+        online_boost_map=online_boost_map,
     )
     step2_candidates = len(merged_tracks)
 
     if progress_cb:
         progress_cb(f"Шаг 2: AI выбирает из {step2_candidates} реальных треков...")
 
-    track_text = _build_track_text(merged_tracks)
+    track_text = _build_track_text(merged_tracks, audio_features=audio_features)
 
     # Language / era / attribute / artist hints for Step 2 prompt
     extra_instructions = ""
@@ -1043,7 +1157,7 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
             f"Выбирай ТОЛЬКО треки этих артистов. Треки других артистов не включать.\n"
         )
 
-    # Musical attribute constraints (instrumental, specific instruments)
+    # Musical attribute constraints (instrumental, specific instruments, tempo)
     if query_attributes:
         attrs_ru = []
         for attr in query_attributes:
@@ -1062,6 +1176,32 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
                 f"действительно обладают этими характеристиками.\n"
                 f"Если подходящих треков нет — верни пустой плейлист <PLAYLIST></PLAYLIST>.\n"
             )
+
+        # Tempo extremes — add genre hints so AI considers less-famous bands
+        if has_max_bpm:
+            extra_instructions += (
+                "\nВАЖНО: выбирай треки с МАКСИМАЛЬНО ВЫСОКИМ темпом (BPM).\n"
+                "Если в строке трека указан BPM — ориентируйся на него.\n"
+                "Предпочитай жанры с объективно высоким темпом: death metal, black metal, "
+                "grindcore, thrash metal, speedcore, drum and bass, hardcore.\n"
+                "Не ограничивайся самыми известными исполнителями — "
+                "малоизвестные дэт/блэк-метал группы часто быстрее Iron Maiden.\n"
+            )
+        elif has_min_bpm:
+            extra_instructions += (
+                "\nВАЖНО: выбирай треки с МИНИМАЛЬНО НИЗКИМ темпом (BPM).\n"
+                "Если в строке трека указан BPM — ориентируйся на него.\n"
+                "Предпочитай: dark ambient, drone, funeral doom, slow blues, ballads, "
+                "post-rock (медленные части).\n"
+            )
+
+    # Per-artist diversity cap (soft, in prompt)
+    if not mentioned_artists and playlist_size > 5:
+        max_per_ai = max(3, playlist_size // 5)
+        extra_instructions += (
+            f"\nРАЗНООБРАЗИЕ: не включай более {max_per_ai} треков от одного исполнителя. "
+            "Старайся охватить как можно больше разных артистов из списка.\n"
+        )
 
     num_requested = min(playlist_size * 2, step2_candidates)
     track_user_msg = (
@@ -1101,6 +1241,14 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
     valid_tracks = _validate_tracks(indices, catalog_index)
     if not valid_tracks:
         raise ValueError("Ни один трек не прошёл валидацию.")
+
+    # Hard diversity cap — no artist can dominate the playlist regardless of
+    # what the AI returned.  Only applied when no specific artist was named.
+    if not mentioned_artists:
+        max_per = max(3, playlist_size // 5)
+        valid_tracks = _enforce_diversity(valid_tracks, max_per)
+        if not valid_tracks:
+            raise ValueError("Ни один трек не прошёл валидацию (после фильтра разнообразия).")
 
     if progress_cb:
         progress_cb("Создание плейлиста...")

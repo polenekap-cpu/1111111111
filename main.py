@@ -657,7 +657,7 @@ class PlaylistApp(App):
             if not self.music_dirs_edit:
                 self.music_dirs_edit = os.path.join(base, "Music")
         else:
-            self.output_dir = os.path.expanduser("~/Music/Playlists")
+            self.output_dir = os.path.expanduser("~/Music/MusicBee/Playlists")
             if not self.music_dirs_edit:
                 self.music_dirs_edit = os.path.expanduser("~/Music")
 
@@ -845,7 +845,7 @@ class PlaylistApp(App):
                 catalog_index,
                 data_dir,
                 progress_cb=update_progress,
-                max_tracks=300,  # ~5 min per batch (1 req/s)
+                max_artists=300,  # ~5 min per batch (1 req/s)
             )
             entries_with_data = sum(
                 1 for v in cache.values() if v.get("instruments") or v.get("tags")

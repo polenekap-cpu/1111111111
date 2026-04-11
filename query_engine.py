@@ -489,7 +489,7 @@ def generate_m3u8(tracks, output_dir, user_query):
     if not safe_query:
         safe_query = "playlist"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    filename = f"{safe_query}_{timestamp}.m3u8"
+    filename = f"{safe_query}_{timestamp}.m3u"
     output_path = os.path.join(output_dir, filename)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("#EXTM3U\n")
@@ -903,23 +903,39 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
         pass
 
     # ---- Step 2c: MusicBrainz priority tracks --------------------------------
-    # When the query mentions a specific instrument, use MB cache to find
-    # locally confirmed tracks that feature it.  These get a priority boost
-    # in the merge step so the AI sees them near the top.
+    # Strategy A (fast, cached): look up pre-built mb_cache.json.
+    # Strategy B (on-demand, ~2 s): global MB tag search — used as fallback
+    #   when the local cache has no instrument matches yet.  This means the
+    #   "флейта" query works even before the user runs full MB enrichment.
     mb_priority_indices: set[int] = set()
-    if mb_cache and query_attributes:
+    if query_attributes:
         try:
-            from musicbrainz_enricher import get_tracks_with_instrument
+            from musicbrainz_enricher import (
+                get_tracks_with_instrument,
+                search_instrument_globally,
+            )
             for attr in query_attributes:
-                if attr.startswith("instrument:"):
-                    instr = attr.split(":", 1)[1]
-                    confirmed = get_tracks_with_instrument(
-                        instr, catalog_index, mb_cache
-                    )
+                if not attr.startswith("instrument:"):
+                    continue
+                instr = attr.split(":", 1)[1]
+
+                # A: from local cache (instant)
+                if mb_cache:
+                    confirmed = get_tracks_with_instrument(instr, catalog_index, mb_cache)
                     mb_priority_indices.update(confirmed)
+
+                # B: live global search if cache gave nothing
+                if not mb_priority_indices:
+                    if progress_cb:
+                        progress_cb(f"MusicBrainz: поиск треков с '{instr}'...")
+                    live_hits = search_instrument_globally(
+                        instr, catalog_index, limit=200
+                    )
+                    mb_priority_indices.update(live_hits)
+
             if mb_priority_indices and progress_cb:
                 progress_cb(
-                    f"MusicBrainz: найдено {len(mb_priority_indices)} подтверждённых треков"
+                    f"MusicBrainz: {len(mb_priority_indices)} треков с подтверждённым инструментом"
                 )
         except ImportError:
             pass

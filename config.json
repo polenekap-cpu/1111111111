@@ -1,12 +1,14 @@
 {
-    "music_dirs": [
-        "/storage/emulated/0/Music"
-    ],
-    "catalog_path": "catalog.tsv",
-    "ai_catalog_path": "catalog_for_ai.txt",
-    "output_dir": "/storage/emulated/0/Music/Playlists",
+    "api_key": "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",
     "api_provider": "openrouter",
-    "ai_model": "google/gemini-2.0-flash-lite-preview-02-05:free",
-    "playlist_size": 15,
-    "theme": "midnight"
+    "ai_model": "openai/gpt-oss-120b:free",
+    "music_dirs": [
+        "D:\\Music"
+    ],
+    "output_dir": "C:\\Users\\Admin\\Music\\MusicBee\\Playlists",
+    "catalog_path": "E:\\playlist generator\\catalog.tsv",
+    "ai_catalog_path": "E:\\playlist generator\\catalog_for_ai.txt",
+    "playlist_size": 50,
+    "theme": "midnight",
+    "lastfm_api_key": "a6bde0dd307a77be2e08a4924d7db57f\r "
 }

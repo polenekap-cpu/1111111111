@@ -119,7 +119,31 @@ _ATMOSPHERE_EXPANSIONS = {
     "энергичн": ["энергичн", "быстр", "ритм", "драйв", "танц", "кача",
                  "огонь", "взрыв"],
     "спокойн": ["тих", "спокойн", "мягк", "нежн", "лад", "мирн", "тишин"],
+    # Instruments / vocal presence
+    "флейт":    ["флейт", "flute", "флут"],
+    "гитар":    ["гитар", "guitar", "акустич"],
+    "фортепиан": ["фортепиан", "piano", "пианино", "клавир"],
+    "скрипк":   ["скрипк", "violin", "виолин", "струнн"],
+    "виолончел": ["виолончел", "cello", "чело"],
+    "труб":     ["труб", "trumpet", "brass"],
+    "саксофон": ["саксофон", "saxophone", "sax", "джаз"],
+    "орган":    ["орган", "organ", "органн"],
 }
+
+# Patterns that signal the query is about musical ATTRIBUTES (not searchable keywords)
+# Used to activate AI world-knowledge mode in Step 2
+_ATTRIBUTE_PATTERNS = [
+    # Instrumental / no vocals — Russian stems without trailing \b (handles inflection)
+    (re.compile(r'без\s+слов|без\s+вокала|инструментальн|instrumental\b|karaoke\b|backing\s+track', re.IGNORECASE), "instrumental"),
+    # Specific instruments (stem match for Russian, exact for English)
+    (re.compile(r'флейт|flute\b',           re.IGNORECASE), "instrument:flute"),
+    (re.compile(r'скрипк|скрипич|violin\b|виолин',  re.IGNORECASE), "instrument:violin"),
+    (re.compile(r'фортепиан|piano\b|пианин', re.IGNORECASE), "instrument:piano"),
+    (re.compile(r'гитар|guitar\b',          re.IGNORECASE), "instrument:guitar"),
+    (re.compile(r'саксофон|saxophone\b|\bsax\b', re.IGNORECASE), "instrument:saxophone"),
+    # Acoustic
+    (re.compile(r'акустическ|acoustic\b',   re.IGNORECASE), "acoustic"),
+]
 
 # Genre/era keywords that should be kept in query_tokens (not stop-words)
 # These are already NOT in _STOP_WORDS, but we make them explicit here
@@ -186,6 +210,14 @@ def expand_query_tokens(query):
     lang = detect_language_preference(query)
     if lang:
         intent["language"] = lang
+
+    # 1b. Detect musical attribute requirements (instrumental, specific instruments)
+    attributes = []
+    for pattern, attr in _ATTRIBUTE_PATTERNS:
+        if pattern.search(query):
+            attributes.append(attr)
+    if attributes:
+        intent["attributes"] = attributes
 
     # 2. Extract era/years from query
     years_match = re.findall(r'\b(19|20)?(\d{2})[хxеs]*\b', query)
@@ -589,6 +621,100 @@ class SearchIndex:
     def _matches_language(self, doc, lang):
         """Alias for compatibility. Checks language match."""
         return self._check_doc_language(doc, lang)
+
+
+# ---------------------------------------------------------------------------
+# Artist mention detection
+# ---------------------------------------------------------------------------
+
+_ARTIST_FUNC_WORDS = frozenset({
+    "и", "или", "с", "в", "на", "о", "а", "но", "из", "до", "по", "от",
+    "the", "and", "or", "of", "a", "an", "feat", "ft",
+})
+
+
+def detect_mentioned_artists(query: str, artist_map: dict) -> list[str]:
+    """Find artist keys from artist_map that are explicitly named in the query.
+
+    Uses two matching strategies (tried in order per artist):
+    1. Exact substring match:  "Noize MC" ∈ "лучшее от Noize MC"
+    2. Stem-based match for Russian inflection:
+       "Король и Шут" → stems ["коро", "шут"]
+       both match in "песни короля и шута" ("коро"⊂"короля", "шут"⊂"шута")
+
+    Longest artist names are tried first to prevent "Шут" stealing the match
+    before "Король и Шут".  Matched spans are blanked so they can't match twice.
+
+    Stem matching is only applied when significant words are long enough to
+    avoid false positives from common short words.
+
+    Args:
+        query:      The user's natural-language query.
+        artist_map: {artist_name_lower: {name, indices}}.
+
+    Returns:
+        List of matched artist keys (lowercased), longest match first.
+        Empty list if no catalog artist is mentioned.
+
+    Examples:
+        "лучшие песни Короля и Шута" → ["король и шут"]
+        "Metallica и AC/DC"          → ["metallica", "ac/dc"]
+        "энергичный рок 80-х"        → []
+    """
+    query_lower = query.lower()
+    remaining = query_lower  # blanked progressively to avoid double-matches
+
+    sorted_keys = sorted(artist_map.keys(), key=len, reverse=True)
+    found = []
+
+    for key in sorted_keys:
+        if len(key) < 3:
+            continue
+
+        # --- Strategy 1: exact substring ---
+        if key in remaining:
+            found.append(key)
+            remaining = remaining.replace(key, " " * len(key), 1)
+            continue
+
+        # --- Strategy 2: stem-based (handles Russian case inflection) ---
+        # Extract content words (skip function words and very short particles)
+        content_words = [
+            w for w in key.split()
+            if w not in _ARTIST_FUNC_WORDS and len(w) >= 3
+        ]
+        if not content_words:
+            continue
+
+        # For a single short word skip stem matching (too many false positives).
+        # E.g. "шут" (3 chars) must match exactly, not via stem "шу".
+        if len(content_words) == 1 and len(content_words[0]) < 5:
+            continue
+
+        # Stem = first max(3, len-2) chars: drops typical Russian case endings
+        # "король"(6) → "коро"(4), "шут"(3) → "шут"(3), "гришин"(6) → "гриш"(4)
+        stems = [w[:max(3, len(w) - 2)] for w in content_words]
+
+        # ALL stems must appear as substrings in remaining query
+        if not all(stem in remaining for stem in stems):
+            continue
+
+        found.append(key)
+
+        # Blank the matched tokens to prevent re-use
+        for stem in stems:
+            pos = remaining.find(stem)
+            if pos < 0:
+                continue
+            # Expand to word boundaries
+            start, end = pos, pos + len(stem)
+            while start > 0 and remaining[start - 1].isalpha():
+                start -= 1
+            while end < len(remaining) and remaining[end].isalpha():
+                end += 1
+            remaining = remaining[:start] + " " * (end - start) + remaining[end:]
+
+    return found
 
     def __len__(self):
         return len(self.documents)

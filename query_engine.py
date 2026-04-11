@@ -39,17 +39,22 @@ ARTIST_SELECT_PROMPT = """\
 Пример: <PLAYLIST>3,17,42,88,103</PLAYLIST>"""
 
 TRACK_SELECT_PROMPT = """\
-Ты — музыкальный куратор. Тебе дан список треков из реального каталога (без галлюцинаций).
+Ты — музыкальный куратор. Тебе дан список реальных треков из локального каталога.
 Формат: INDEX|АРТИСТ|НАЗВАНИЕ|ГОД
 
-Задача: выбери до N треков, идеально подходящих под запрос.
+Задача: выбери до N треков, которые НАИЛУЧШИМ ОБРАЗОМ соответствуют запросу.
 
 Правила:
-- Выбирай только треки, точно подходящие по жанру, настроению и эпохе.
-- Соблюдай язык запроса: «на русском» → ТОЛЬКО кириллические треки, «in english» → ТОЛЬКО латиница.
+- Используй свои знания о каждом треке и артисте: жанр, инструменты, наличие вокала,
+  настроение, язык — даже если это явно не указано в названии.
+- Если запрос про инструментальную музыку или конкретный инструмент (флейта, скрипка и т.д.)
+  — выбирай треки, которые, по твоим знаниям, действительно содержат этот инструмент или
+  не содержат вокала. Если таких нет в списке — верни пустой плейлист.
+- Если запрос называет конкретного исполнителя — включай ТОЛЬКО треки этого исполнителя.
+- Соблюдай язык запроса: «на русском» → кириллические треки, «in english» → латиница.
 - НЕ дублируй: если есть «Song (Live)» и «Song» — только студийную версию.
-- Не ставь подряд треки одного артиста.
-- Лучше меньше, но точнее.
+- Не ставь подряд треки одного артиста (если не запрошен конкретный артист).
+- Лучше меньше, но точнее. Лучше 5 релевантных треков, чем 30 сомнительных.
 
 Ответ: верни ТОЛЬКО индексы через запятую внутри тегов <PLAYLIST> и </PLAYLIST>.
 Пример: <PLAYLIST>1452,891,23044,7821,445</PLAYLIST>"""
@@ -658,10 +663,6 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
     num_artists = len(artist_map)
     data_dir = os.path.dirname(os.path.abspath(catalog_path))
 
-    # ---- Step 1: AI selects relevant artists --------------------------------
-    if progress_cb:
-        progress_cb(f"Шаг 1: отбор артистов из {num_artists} в каталоге...")
-
     rich_artist_data = _load_rich_artist_data(data_dir)
     try:
         from lastfm_enricher import load_cache as _load_lastfm
@@ -669,36 +670,61 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
     except ImportError:
         lastfm_cache = {}
 
-    artist_list_text, num_to_key = _build_artist_list_text(
-        artist_map, rich_artist_data, lastfm_cache
-    )
-    artist_user_msg = (
-        f"Список артистов:\n{artist_list_text}\n\n"
-        f"Запрос: \"{user_query}\"\n"
-        f"Выбери ~{ARTIST_SELECT_TARGET} артистов, у которых наиболее вероятно "
-        f"есть треки под этот запрос."
-    )
+    # ---- Pre-step: detect specific artists and musical attributes -----------
+    # If the user explicitly names artists from the catalog, skip the AI
+    # artist-selection step and go directly to their tracks.  This prevents
+    # "лучшие песни Короля и Шута" from pulling in Noize MC or PHARAOH.
+    mentioned_artists = []
+    query_attributes = []  # e.g. ["instrumental", "instrument:flute"]
+    try:
+        from search_local import detect_mentioned_artists, expand_query_tokens
+        mentioned_artists = detect_mentioned_artists(user_query, artist_map)
+        _, intent_pre = expand_query_tokens(user_query)
+        query_attributes = intent_pre.get("attributes", [])
+    except ImportError:
+        pass
 
-    artist_response = _call_ai(api_provider,
-        api_key, model, ARTIST_SELECT_PROMPT, artist_user_msg, max_tokens=1024
-    )
-
-    artist_numbers = parse_indices(artist_response)
-    selected_artist_keys = set()
-    for num in artist_numbers:
-        key = num_to_key.get(num)
-        if key:
-            selected_artist_keys.add(key)
-
-    step1_artists = len(selected_artist_keys)
-    if progress_cb:
-        progress_cb(f"Шаг 1 завершён: выбрано {step1_artists} артистов.")
-
-    # Fallback if step 1 returned nothing
-    if not selected_artist_keys:
+    # ---- Step 1: select relevant artists ------------------------------------
+    if mentioned_artists:
+        # Specific artists named → skip AI call, use them directly
+        selected_artist_keys = set(mentioned_artists)
+        step1_artists = len(selected_artist_keys)
+        names = ", ".join(artist_map[k]["name"] for k in mentioned_artists if k in artist_map)
         if progress_cb:
-            progress_cb("Шаг 1 не вернул артистов. Используем весь каталог.")
-        selected_artist_keys = set(artist_map.keys())
+            progress_cb(f"Найдены конкретные артисты: {names}")
+    else:
+        if progress_cb:
+            progress_cb(f"Шаг 1: отбор артистов из {num_artists} в каталоге...")
+
+        artist_list_text, num_to_key = _build_artist_list_text(
+            artist_map, rich_artist_data, lastfm_cache
+        )
+        artist_user_msg = (
+            f"Список артистов:\n{artist_list_text}\n\n"
+            f"Запрос: \"{user_query}\"\n"
+            f"Выбери ~{ARTIST_SELECT_TARGET} артистов, у которых наиболее вероятно "
+            f"есть треки под этот запрос."
+        )
+
+        artist_response = _call_ai(api_provider,
+            api_key, model, ARTIST_SELECT_PROMPT, artist_user_msg, max_tokens=1024
+        )
+
+        artist_numbers = parse_indices(artist_response)
+        selected_artist_keys = set()
+        for num in artist_numbers:
+            key = num_to_key.get(num)
+            if key:
+                selected_artist_keys.add(key)
+
+        step1_artists = len(selected_artist_keys)
+        if progress_cb:
+            progress_cb(f"Шаг 1 завершён: выбрано {step1_artists} артистов.")
+
+        if not selected_artist_keys:
+            if progress_cb:
+                progress_cb("Шаг 1 не вернул артистов. Используем весь каталог.")
+            selected_artist_keys = set(artist_map.keys())
 
     # ---- Step 2b: TF-IDF for literal keyword matches ------------------------
     tfidf_tracks = []
@@ -730,20 +756,50 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
 
     track_text = _build_track_text(merged_tracks)
 
-    # Language/era hints from intent parser
+    # Language / era / attribute / artist hints for Step 2 prompt
     extra_instructions = ""
     try:
         from search_local import expand_query_tokens
         _, intent = expand_query_tokens(user_query)
         if intent.get("language") == "ru":
-            extra_instructions = "\nВАЖНО: выбирай ТОЛЬКО русскоязычные треки (кириллица).\n"
+            extra_instructions += "\nВАЖНО: выбирай ТОЛЬКО русскоязычные треки (кириллица).\n"
         elif intent.get("language") == "en":
-            extra_instructions = "\nВАЖНО: выбирай ТОЛЬКО англоязычные треки.\n"
+            extra_instructions += "\nВАЖНО: выбирай ТОЛЬКО англоязычные треки.\n"
         if intent.get("era_ranges"):
             eras_str = ", ".join(f"{s}е" for s, _ in intent["era_ranges"])
             extra_instructions += f"Предпочтение трекам {eras_str}.\n"
     except ImportError:
         pass
+
+    # Specific artist constraint
+    if mentioned_artists:
+        names = ", ".join(
+            artist_map[k]["name"] for k in mentioned_artists if k in artist_map
+        )
+        extra_instructions += (
+            f"\nВАЖНО: запрос относится к конкретным исполнителям: {names}.\n"
+            f"Выбирай ТОЛЬКО треки этих артистов. Треки других артистов не включать.\n"
+        )
+
+    # Musical attribute constraints (instrumental, specific instruments)
+    if query_attributes:
+        attrs_ru = []
+        for attr in query_attributes:
+            if attr == "instrumental":
+                attrs_ru.append("инструментальные (без вокала)")
+            elif attr == "acoustic":
+                attrs_ru.append("акустические")
+            elif attr.startswith("instrument:"):
+                instr = attr.split(":")[1]
+                attrs_ru.append(f"с {instr}")
+        if attrs_ru:
+            extra_instructions += (
+                f"\nВАЖНО: запрос требует конкретных музыкальных характеристик: "
+                f"{', '.join(attrs_ru)}.\n"
+                f"Используй своё знание о треках. Выбирай ТОЛЬКО те треки, которые "
+                f"действительно обладают этими характеристиками.\n"
+                f"Если подходящих треков нет — верни пустой плейлист <PLAYLIST></PLAYLIST>.\n"
+            )
 
     num_requested = min(playlist_size * 2, step2_candidates)
     track_user_msg = (

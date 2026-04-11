@@ -143,6 +143,17 @@ _ATTRIBUTE_PATTERNS = [
     (re.compile(r'саксофон|saxophone\b|\bsax\b', re.IGNORECASE), "instrument:saxophone"),
     # Acoustic
     (re.compile(r'акустическ|acoustic\b',   re.IGNORECASE), "acoustic"),
+    # Tempo extremes — "самый быстрый темп", "быстрее всего", "high bpm"
+    (re.compile(
+        r'самы[йх]\s+быстр|быстрей?ш[а-яё]*|максимальн[а-яё]*\s+темп|'
+        r'fastest\s+tempo?\b|highest?\s+bpm\b|high\s+bpm\b|speed\s+metal\b',
+        re.IGNORECASE,
+    ), "max_bpm"),
+    (re.compile(
+        r'самы[йх]\s+медленн|медленнейш[а-яё]*|минимальн[а-яё]*\s+темп|'
+        r'slowest\s+tempo?\b|lowest?\s+bpm\b|low\s+bpm\b',
+        re.IGNORECASE,
+    ), "min_bpm"),
 ]
 
 # Genre/era keywords that should be kept in query_tokens (not stop-words)

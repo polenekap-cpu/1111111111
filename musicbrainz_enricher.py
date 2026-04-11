@@ -266,7 +266,7 @@ def enrich_catalog_mb(
     data_dir: str,
     progress_cb=None,
     max_artists: int = 400,
-) -> dict:
+) -> tuple[dict, dict]:
     """Incrementally enrich catalog using per-artist batch strategy.
 
     ONE request per unique artist returns up to 100 recordings with tags.
@@ -283,7 +283,8 @@ def enrich_catalog_mb(
         max_artists:   max new artists to fetch per call (~1.1 s each)
 
     Returns:
-        Full cache dict.
+        (cache_dict, stats_dict)
+        stats_dict has keys: processed (int), remaining (int), with_instr (int)
     """
     cache = load_mb_cache(data_dir)
     today = time.strftime("%Y-%m-%d")
@@ -370,22 +371,30 @@ def enrich_catalog_mb(
             )
 
         if fetched >= max_artists:
-            if progress_cb:
-                remaining = total - fetched
-                progress_cb(i + 1, total,
-                    f"MusicBrainz: пауза. Запустите снова для продолжения "
-                    f"({remaining} артистов осталось).")
             break
 
     _save_mb_cache(data_dir, cache)
 
-    if progress_cb:
-        with_data = sum(1 for v in cache.values() if v.get("instruments") or v.get("tags"))
-        progress_cb(total, total,
-            f"MusicBrainz: готово. {with_data} треков с данными "
-            f"(всего записей в кэше: {len(cache):,})")
+    with_instr = sum(1 for v in cache.values() if v.get("instruments") or v.get("tags"))
+    remaining  = max(0, total - fetched)
 
-    return cache
+    if progress_cb:
+        if remaining > 0:
+            progress_cb(
+                fetched, total,
+                f"MusicBrainz: пауза — обработано {fetched} из {total} артистов "
+                f"({with_instr} треков с данными). "
+                f"Нажмите кнопку ещё раз чтобы продолжить ({remaining} осталось).",
+            )
+        else:
+            progress_cb(
+                total, total,
+                f"MusicBrainz: всё готово! Проверено {total} артистов, "
+                f"{with_instr} треков с данными об инструментах.",
+            )
+
+    stats = {"processed": fetched, "remaining": remaining, "with_instr": with_instr}
+    return cache, stats
 
 
 def _artist_fully_cached(artist_info: dict, cache: dict) -> bool:

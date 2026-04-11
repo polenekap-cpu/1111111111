@@ -314,6 +314,12 @@ KV = '''
             disabled: app.is_busy
 
         RoundedButton:
+            text: 'Обогатить с Last.fm'
+            on_release: app.scan_lastfm()
+            disabled: app.is_busy
+            background_color: app.theme.get('success', (0.55,0.8,0.55,1))
+
+        RoundedButton:
             text: 'Очистить каталог'
             on_release: app.clear_catalog()
             background_color: app.theme.get('error', (0.9,0.3,0.3,1))
@@ -414,6 +420,24 @@ KV = '''
                     color: app.theme.get('text_secondary', (0.55,0.55,0.62,1))
                     halign: 'left'
                     text_size: self.size
+
+            # --- Last.fm ---
+            Label:
+                text: 'Last.fm API ключ (для обогащения каталога)'
+                font_size: dp(13)
+                color: app.theme.get('text_secondary', (0.55,0.55,0.62,1))
+                size_hint_y: None
+                height: dp(20)
+                halign: 'left'
+                text_size: self.size
+
+            StyledInput:
+                hint_text: 'Ключ с last.fm/api — бесплатно'
+                text: app.lastfm_api_key
+                on_text: app.lastfm_api_key = self.text
+                password: True
+                size_hint_y: None
+                height: dp(44)
 
             # --- Model ---
             Label:
@@ -551,14 +575,15 @@ class PlaylistApp(App):
     playlist_size  = NumericProperty(30)
     settings_status = StringProperty("")
 
-    api_key       = StringProperty("")
-    api_provider  = StringProperty("openrouter")
-    ai_model      = StringProperty("deepseek/deepseek-chat-v3-0324:free")
+    api_key         = StringProperty("")
+    api_provider    = StringProperty("openrouter")
+    ai_model        = StringProperty("deepseek/deepseek-chat-v3-0324:free")
     music_dirs_edit = StringProperty("")
-    output_dir    = StringProperty("")
-    theme_name    = StringProperty("midnight")
-    show_api_key  = BooleanProperty(False)
-    query_text    = StringProperty("")
+    output_dir      = StringProperty("")
+    theme_name      = StringProperty("midnight")
+    show_api_key    = BooleanProperty(False)
+    query_text      = StringProperty("")
+    lastfm_api_key  = StringProperty("")
 
     theme = ObjectProperty(_ThemeData(THEMES["midnight"]), rebind=True)
 
@@ -631,10 +656,11 @@ class PlaylistApp(App):
         try:
             with open(cfg_path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
-            self.api_key      = cfg.get("api_key", "")
-            self.api_provider = cfg.get("api_provider", "openrouter")
-            self.ai_model     = cfg.get("ai_model", cfg.get("model", self.ai_model))
+            self.api_key       = cfg.get("api_key", "")
+            self.api_provider  = cfg.get("api_provider", "openrouter")
+            self.ai_model      = cfg.get("ai_model", cfg.get("model", self.ai_model))
             self.playlist_size = cfg.get("playlist_size", 30)
+            self.lastfm_api_key = cfg.get("lastfm_api_key", "")
 
             dirs = cfg.get("music_dirs", [])
             if platform == "android":
@@ -659,6 +685,7 @@ class PlaylistApp(App):
             "ai_catalog_path":  os.path.join(data_dir, "catalog_for_ai.txt"),
             "playlist_size":    self.playlist_size,
             "theme":            self.theme_name,
+            "lastfm_api_key":   self.lastfm_api_key,
         }
 
     def _write_config(self):
@@ -727,6 +754,52 @@ class PlaylistApp(App):
         self.scan_status = msg
         if total > 0:
             self.progress_value = (curr / total) * 100
+
+    def scan_lastfm(self):
+        if self.is_busy:
+            return
+        if not self.lastfm_api_key.strip():
+            self.scan_status = "Введите Last.fm API ключ в Настройках"
+            return
+        catalog_path = os.path.join(_app_data_dir(), "catalog.tsv")
+        if not os.path.exists(catalog_path):
+            self.scan_status = "Сначала выполните сканирование библиотеки"
+            return
+        self.is_busy = True
+        self.progress_value = 0
+        self.scan_status = "Запуск обогащения с Last.fm..."
+        threading.Thread(target=self._lastfm_thread, daemon=True).start()
+
+    def _lastfm_thread(self):
+        def update_progress(curr, total, msg):
+            Clock.schedule_once(lambda dt: self._sync_progress(curr, total, msg))
+
+        try:
+            import query_engine
+            import lastfm_enricher
+
+            self._write_config()
+            cfg = query_engine.load_config(_config_path())
+            catalog_index = query_engine.load_catalog_index(cfg["catalog_path"])
+            if not catalog_index:
+                raise ValueError("Каталог пуст")
+
+            artist_map = query_engine.build_artist_index(catalog_index)
+            data_dir = os.path.dirname(os.path.abspath(cfg["catalog_path"]))
+
+            cache = lastfm_enricher.enrich_catalog_artists(
+                self.lastfm_api_key.strip(),
+                artist_map,
+                data_dir,
+                progress_cb=update_progress,
+            )
+            new_entries = sum(1 for v in cache.values() if v.get("tags"))
+            msg = f"Last.fm: обогащено {new_entries} артистов"
+        except Exception as e:
+            msg = f"Ошибка Last.fm: {e}"
+            traceback.print_exc()
+
+        Clock.schedule_once(lambda dt: self._end_busy(msg))
 
     def clear_catalog(self):
         data_dir = _app_data_dir()

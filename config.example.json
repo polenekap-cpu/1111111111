@@ -9,5 +9,6 @@
   "ai_model": "deepseek/deepseek-chat-v3-0324:free",
   "playlist_size": 15,
   "theme": "midnight",
-  "lastfm_api_key": ""
+  "lastfm_api_key": "",
+  "ai_query_decomposition": true
 }

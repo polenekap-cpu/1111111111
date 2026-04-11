@@ -26,6 +26,29 @@ import requests
 # Prompts
 # ---------------------------------------------------------------------------
 
+DECOMPOSE_PROMPT = """\
+Parse the user's music query (may be in Russian or English) into a JSON structure.
+Respond with ONLY a single JSON object on one line, no explanation, no markdown.
+
+Schema (all fields required; use null when unknown):
+{"genres":[],"mood":null,"energy":"medium","bpm_min":null,"bpm_max":null,"vocal":"any","mode":"any","language":null}
+
+Field rules:
+- genres:   list of genre names in English, e.g. ["rock","heavy metal"]
+- mood:     single English word/phrase, e.g. "melancholic", "energetic", "relaxing"
+- energy:   "low" | "medium" | "high"
+- bpm_min / bpm_max: integer BPM bounds or null
+- vocal:    "any" | "vocal" | "instrumental"
+- mode:     "any" | "major" | "minor"
+- language: null | "ru" | "en" | "fr" | "ja" | "ko" | "es"
+
+Examples:
+  Query: "расслабляющая инструментальная музыка с флейтой"
+  → {"genres":["new age","classical"],"mood":"relaxing","energy":"low","bpm_min":null,"bpm_max":90,"vocal":"instrumental","mode":"any","language":null}
+
+  Query: "energetic metal from the 80s"
+  → {"genres":["heavy metal","hard rock"],"mood":"energetic","energy":"high","bpm_min":140,"bpm_max":null,"vocal":"vocal","mode":"any","language":"en"}"""
+
 ARTIST_SELECT_PROMPT = """\
 Тебе дан пронумерованный список артистов из локальной музыкальной библиотеки.
 Формат строки: INDEX|АРТИСТ|КОЛ-ВО ТРЕКОВ|ГОДЫ|ПРИМЕРЫ ТРЕКОВ|ЖАНРЫ|ПОПУЛЯРНОСТЬ
@@ -62,6 +85,8 @@ TRACK_SELECT_PROMPT = """\
 STRICT_PROMPT = """\
 Ответь ТОЛЬКО индексами через запятую внутри тегов <PLAYLIST></PLAYLIST>.
 Пример: <PLAYLIST>1452,891,23044</PLAYLIST>"""
+
+DECOMPOSE_MIN_WORDS = 3   # minimum query words to trigger decomposition
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 GOOGLE_API_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
@@ -285,6 +310,73 @@ def _call_ai(api_provider, api_key, model, system_prompt, user_message, max_toke
     if api_provider == "google":
         return _call_google(api_key, model, system_prompt, user_message, max_tokens)
     return _call_openrouter(api_key, model, system_prompt, user_message, max_tokens)
+
+
+# ---------------------------------------------------------------------------
+# AI query decomposition (pre-step)
+# ---------------------------------------------------------------------------
+
+_DECOMPOSE_DEFAULT = {
+    "genres": [], "mood": None, "energy": "medium",
+    "bpm_min": None, "bpm_max": None,
+    "vocal": "any", "mode": "any", "language": None,
+}
+
+
+def decompose_query(
+    api_provider: str,
+    api_key: str,
+    model: str,
+    user_query: str,
+) -> dict:
+    """Pre-step: convert free-text query to structured intent via AI.
+
+    Uses a very compact prompt (≈150 input tokens, ≤100 output tokens) to
+    minimise API-call quota usage.  On any error returns the default dict
+    so the rest of the pipeline can continue unaffected.
+
+    The returned dict has keys:
+        genres (list[str]), mood (str|None), energy ("low"|"medium"|"high"),
+        bpm_min (int|None), bpm_max (int|None),
+        vocal ("any"|"vocal"|"instrumental"),
+        mode ("any"|"major"|"minor"),
+        language (str|None — same codes as search_local).
+
+    Only called when the query has >= DECOMPOSE_MIN_WORDS meaningful words
+    and no explicit artist names were detected (to save API calls).
+    """
+    try:
+        raw = _call_ai(
+            api_provider, api_key, model,
+            DECOMPOSE_PROMPT,
+            f'Query: "{user_query}"',
+            max_tokens=160,
+        )
+        # Strip markdown fences if the model wrapped the JSON
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```\w*\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw.strip())
+
+        parsed = json.loads(raw.strip())
+
+        result = dict(_DECOMPOSE_DEFAULT)
+        result["genres"]   = [str(g) for g in (parsed.get("genres") or [])]
+        result["mood"]     = parsed.get("mood") or None
+        energy = parsed.get("energy", "medium")
+        result["energy"]   = energy if energy in ("low", "medium", "high") else "medium"
+        result["bpm_min"]  = int(parsed["bpm_min"])  if parsed.get("bpm_min")  else None
+        result["bpm_max"]  = int(parsed["bpm_max"])  if parsed.get("bpm_max")  else None
+        vocal = parsed.get("vocal", "any")
+        result["vocal"]    = vocal  if vocal  in ("any", "vocal", "instrumental") else "any"
+        mode  = parsed.get("mode",  "any")
+        result["mode"]     = mode   if mode   in ("any", "major", "minor")        else "any"
+        result["language"] = parsed.get("language") or None
+        return result
+
+    except Exception as exc:
+        print(f"[decompose_query] skipped: {exc}", file=sys.stderr)
+        return dict(_DECOMPOSE_DEFAULT)
 
 
 # ---------------------------------------------------------------------------
@@ -552,16 +644,19 @@ def _get_tracks_for_artists(selected_keys, artist_map, catalog_index,
 
 def _merge_tracks_scored(artist_tracks, tfidf_tracks, limit,
                           max_per_artist=MAX_TRACKS_PER_ARTIST,
-                          lastfm_cache=None):
+                          lastfm_cache=None,
+                          mb_priority_indices=None):
     """Merge artist tracks + TF-IDF results into a ranked, diverse candidate list.
 
     Strategy:
     1. Assign TF-IDF scores to all artist tracks (0.0 if not in TF-IDF results).
-    2. Pre-deduplicate: remove Live/Remaster/Acoustic variants.
-    3. Group by artist; sort each group by score (desc); cap at max_per_artist.
-    4. Sort artist groups by their best track's score so most relevant artists
+    2. Boost MusicBrainz-confirmed tracks (instrument matches) with a high score
+       so they appear near the top of the candidate list for AI Step 2.
+    3. Pre-deduplicate: remove Live/Remaster/Acoustic variants.
+    4. Group by artist; sort each group by score (desc); cap at max_per_artist.
+    5. Sort artist groups by their best track's score so most relevant artists
        appear first in the interleaved output.
-    5. Round-robin interleave: take slot-0 from each artist, then slot-1, etc.
+    6. Round-robin interleave: take slot-0 from each artist, then slot-1, etc.
        This guarantees diversity even after hard truncation to ``limit``.
 
     Result: a balanced list where no artist dominates AND the most relevant
@@ -569,7 +664,9 @@ def _merge_tracks_scored(artist_tracks, tfidf_tracks, limit,
     """
     from collections import defaultdict
 
-    tfidf_score_map = {t["index"]: t.get("score", 0.0) for t in tfidf_tracks}
+    tfidf_score_map   = {t["index"]: t.get("score", 0.0) for t in tfidf_tracks}
+    mb_priority_set   = set(mb_priority_indices or [])
+    MB_BOOST          = 20.0   # score assigned to MB-confirmed tracks
 
     # Merge, preserving scores
     seen = set()
@@ -578,12 +675,18 @@ def _merge_tracks_scored(artist_tracks, tfidf_tracks, limit,
         idx = t["index"]
         if idx not in seen:
             seen.add(idx)
-            all_tracks.append({**t, "score": tfidf_score_map.get(idx, 0.0)})
+            base_score = tfidf_score_map.get(idx, 0.0)
+            if idx in mb_priority_set:
+                base_score = max(base_score, MB_BOOST)
+            all_tracks.append({**t, "score": base_score})
     for t in tfidf_tracks:
         idx = t["index"]
         if idx not in seen:
             seen.add(idx)
-            all_tracks.append(t)
+            score = t.get("score", 0.0)
+            if idx in mb_priority_set:
+                score = max(score, MB_BOOST)
+            all_tracks.append({**t, "score": score})
 
     # Pre-deduplicate variants
     all_tracks = _prededup_tracks(all_tracks)
@@ -598,7 +701,7 @@ def _merge_tracks_scored(artist_tracks, tfidf_tracks, limit,
         by_artist[key].sort(key=lambda t: t.get("score", 0.0), reverse=True)
         by_artist[key] = by_artist[key][:max_per_artist]
 
-    # Sort artist groups: primary = best TF-IDF score, secondary = Last.fm
+    # Sort artist groups: primary = best TF-IDF/MB score, secondary = Last.fm
     # listener count.  When TF-IDF scores are all 0 (e.g. "самые популярные"),
     # listener count decides the order → Beatles (7.8M) before niche acts.
     def _sort_key(group):
@@ -670,7 +773,21 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
     except ImportError:
         lastfm_cache = {}
 
-    # ---- Pre-step: detect specific artists and musical attributes -----------
+    # Load optional enrichment caches (audio features + MusicBrainz)
+    audio_features: dict = {}
+    mb_cache:        dict = {}
+    try:
+        from audio_analyzer import load_audio_features
+        audio_features = load_audio_features(data_dir)
+    except ImportError:
+        pass
+    try:
+        from musicbrainz_enricher import load_mb_cache
+        mb_cache = load_mb_cache(data_dir)
+    except ImportError:
+        pass
+
+    # ---- Pre-step A: detect specific artists and musical attributes ---------
     # If the user explicitly names artists from the catalog, skip the AI
     # artist-selection step and go directly to their tracks.  This prevents
     # "лучшие песни Короля и Шута" from pulling in Noize MC or PHARAOH.
@@ -683,6 +800,33 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
         query_attributes = intent_pre.get("attributes", [])
     except ImportError:
         pass
+
+    # ---- Pre-step B: AI query decomposition --------------------------------
+    # Convert the free-text query into a structured intent (genres, mood,
+    # energy, BPM range, vocal/instrumental, major/minor, language).
+    # Only called when:
+    #   • no specific artist names detected (saves an API call otherwise)
+    #   • query is long enough to warrant decomposition
+    #   • config does not disable it ("ai_query_decomposition": false)
+    structured_intent: dict = dict(_DECOMPOSE_DEFAULT)
+    run_decompose = (
+        not mentioned_artists
+        and len([w for w in user_query.split() if len(w) >= 3]) >= DECOMPOSE_MIN_WORDS
+        and cfg.get("ai_query_decomposition", True)
+    )
+    if run_decompose:
+        if progress_cb:
+            progress_cb("Анализ запроса (AI)...")
+        structured_intent = decompose_query(
+            api_provider, api_key, model, user_query
+        )
+        if progress_cb:
+            genres_str = ", ".join(structured_intent.get("genres", [])) or "—"
+            progress_cb(
+                f"Запрос: жанры={genres_str}, "
+                f"энергия={structured_intent.get('energy','?')}, "
+                f"вокал={structured_intent.get('vocal','?')}"
+            )
 
     # ---- Step 1: select relevant artists ------------------------------------
     if mentioned_artists:
@@ -699,9 +843,30 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
         artist_list_text, num_to_key = _build_artist_list_text(
             artist_map, rich_artist_data, lastfm_cache
         )
+
+        # Build structured hint lines from AI decomposition
+        hint_lines = []
+        if structured_intent.get("genres"):
+            hint_lines.append("Жанры: " + ", ".join(structured_intent["genres"]))
+        if structured_intent.get("mood"):
+            hint_lines.append(f"Настроение: {structured_intent['mood']}")
+        energy_level = structured_intent.get("energy", "medium")
+        if energy_level != "medium":
+            energy_ru = {"low": "тихая/спокойная", "high": "энергичная/динамичная"}.get(
+                energy_level, energy_level
+            )
+            hint_lines.append(f"Энергетика: {energy_ru}")
+        if structured_intent.get("vocal") == "instrumental":
+            hint_lines.append("Тип: инструментальная музыка (без вокала)")
+        if structured_intent.get("language"):
+            hint_lines.append(f"Язык: {structured_intent['language']}")
+
+        hint_block = ("\nКонтекст запроса:\n" + "\n".join(hint_lines) + "\n") if hint_lines else ""
+
         artist_user_msg = (
             f"Список артистов:\n{artist_list_text}\n\n"
             f"Запрос: \"{user_query}\"\n"
+            f"{hint_block}"
             f"Выбери ~{ARTIST_SELECT_TARGET} артистов, у которых наиболее вероятно "
             f"есть треки под этот запрос."
         )
@@ -737,6 +902,39 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
     except ImportError:
         pass
 
+    # ---- Step 2c: MusicBrainz priority tracks --------------------------------
+    # When the query mentions a specific instrument, use MB cache to find
+    # locally confirmed tracks that feature it.  These get a priority boost
+    # in the merge step so the AI sees them near the top.
+    mb_priority_indices: set[int] = set()
+    if mb_cache and query_attributes:
+        try:
+            from musicbrainz_enricher import get_tracks_with_instrument
+            for attr in query_attributes:
+                if attr.startswith("instrument:"):
+                    instr = attr.split(":", 1)[1]
+                    confirmed = get_tracks_with_instrument(
+                        instr, catalog_index, mb_cache
+                    )
+                    mb_priority_indices.update(confirmed)
+            if mb_priority_indices and progress_cb:
+                progress_cb(
+                    f"MusicBrainz: найдено {len(mb_priority_indices)} подтверждённых треков"
+                )
+        except ImportError:
+            pass
+
+    # ---- Step 2d: Audio feature pre-filter ----------------------------------
+    # Build acoustic constraints from AI decomposition result, then apply them
+    # to the artist-track pool.  Only active when audio_features.json has data.
+    audio_constraints: dict = {}
+    if audio_features:
+        try:
+            from audio_analyzer import build_audio_constraints, filter_by_audio_features
+            audio_constraints = build_audio_constraints(structured_intent)
+        except ImportError:
+            pass
+
     # ---- Step 2: Collect + score + merge tracks -----------------------------
     # Per-artist cap + TF-IDF scoring + round-robin interleave ensure that:
     # - No single artist dominates (AC/DC doesn't crowd out Beatles)
@@ -745,9 +943,26 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
     artist_tracks = _get_tracks_for_artists(
         selected_artist_keys, artist_map, catalog_index
     )
+
+    # Apply audio pre-filter when we have both feature data and constraints
+    if audio_constraints and audio_features:
+        try:
+            from audio_analyzer import filter_by_audio_features
+            before = len(artist_tracks)
+            artist_tracks = filter_by_audio_features(
+                artist_tracks, audio_features, audio_constraints
+            )
+            if progress_cb and len(artist_tracks) < before:
+                progress_cb(
+                    f"Акустический фильтр: {len(artist_tracks)} из {before} треков"
+                )
+        except ImportError:
+            pass
+
     merged_tracks = _merge_tracks_scored(
         artist_tracks, tfidf_tracks, TRACK_CONTEXT_LIMIT,
         lastfm_cache=lastfm_cache,
+        mb_priority_indices=mb_priority_indices,
     )
     step2_candidates = len(merged_tracks)
 
@@ -761,15 +976,46 @@ def create_playlist(config_path=None, user_query="", progress_cb=None):
     try:
         from search_local import expand_query_tokens
         _, intent = expand_query_tokens(user_query)
-        if intent.get("language") == "ru":
+        # Language: prefer rule-based detection (more reliable than AI for
+        # short phrases like "на русском"); fall back to AI decomposition.
+        detected_lang = intent.get("language") or structured_intent.get("language")
+        if detected_lang == "ru":
             extra_instructions += "\nВАЖНО: выбирай ТОЛЬКО русскоязычные треки (кириллица).\n"
-        elif intent.get("language") == "en":
+        elif detected_lang == "en":
             extra_instructions += "\nВАЖНО: выбирай ТОЛЬКО англоязычные треки.\n"
+        elif detected_lang:
+            extra_instructions += f"\nПредпочтение трекам на языке: {detected_lang}.\n"
         if intent.get("era_ranges"):
             eras_str = ", ".join(f"{s}е" for s, _ in intent["era_ranges"])
             extra_instructions += f"Предпочтение трекам {eras_str}.\n"
     except ImportError:
         pass
+
+    # Structured intent hints from AI decomposition
+    if structured_intent.get("mood"):
+        extra_instructions += f"\nНастроение/атмосфера: {structured_intent['mood']}.\n"
+    ai_vocal = structured_intent.get("vocal", "any")
+    if ai_vocal == "instrumental" and "инструментальн" not in extra_instructions:
+        extra_instructions += "\nВАЖНО: предпочтение инструментальным трекам (без вокала).\n"
+    elif ai_vocal == "vocal":
+        extra_instructions += "\nПредпочтение трекам с вокалом.\n"
+    ai_mode = structured_intent.get("mode", "any")
+    if ai_mode == "major":
+        extra_instructions += "\nПредпочтение мажорным, жизнерадостным трекам.\n"
+    elif ai_mode == "minor":
+        extra_instructions += "\nПредпочтение минорным, меланхоличным трекам.\n"
+    if structured_intent.get("energy") == "high":
+        extra_instructions += "\nПредпочтение энергичным, динамичным трекам.\n"
+    elif structured_intent.get("energy") == "low":
+        extra_instructions += "\nПредпочтение тихим, спокойным трекам.\n"
+
+    # MusicBrainz confirmation note (helps AI know instrument data is available)
+    if mb_priority_indices:
+        extra_instructions += (
+            f"\nМузыкальные данные: {len(mb_priority_indices)} треков в списке "
+            "подтверждены базой MusicBrainz как содержащие запрошенный инструмент. "
+            "Отдай им приоритет.\n"
+        )
 
     # Specific artist constraint
     if mentioned_artists:

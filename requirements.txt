@@ -1,3 +1,7 @@
 kivy[full]
 mutagen
 requests
+# Optional: acoustic analysis (BPM, energy, mode detection).
+# Install with: pip install librosa
+# Requires ~200 MB; skip if disk space is limited.
+librosa
